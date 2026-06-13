@@ -237,6 +237,18 @@ The binomial engine supports three tree specifications:
 
 For numerical inversion, the implied-volatility and implied-spot routines use bracket expansion followed by bisection. This is slower than Newton-Raphson in some cases, but it is stable and avoids requiring an analytical derivative.
 
+## Running tests
+
+Install pytest if needed:
+```bash
+python -m pip install pytest
+```
+
+Run the test suite from the project root:
+```bash
+python -m pytest tests
+```
+
 ## Limitations
 
 This is a study and portfolio project, not a production trading library. It does not include market-data ingestion, calibration, volatility-surface construction, portfolio risk aggregation, or validation against a professional pricing system.

@@ -25,7 +25,7 @@ The Asian, Power, Binary, Barrier, Rainbow, Exchange option, and short-rate bond
 
 Python 3.10 or newer.
 
-No third-party packages are required. The toolkit only uses the Python standard library.
+The pricing toolkit itself only uses the Python standard library. The test suite uses `pytest`.
 
 ## Project structure
 
@@ -33,7 +33,11 @@ No third-party packages are required. The toolkit only uses the Python standard 
 options-pricing-toolkit/
 ├── options_pricing_toolkit.py
 ├── README.md
-└── .gitignore
+├── .gitignore
+└── tests/
+    ├── test_black_scholes.py
+    ├── test_implied_volatility.py
+    └── test_monte_carlo.py
 ```
 
 ## Quick start
@@ -153,6 +157,22 @@ python options_pricing_toolkit.py perpetual \
   --dividend-yield 0.02
 ```
 
+Compound option:
+
+```bash
+python options_pricing_toolkit.py compound \
+  --kind call_on_call \
+  --spot 100 \
+  --strike 100 \
+  --volatility 0.20 \
+  --rate 0.05 \
+  --maturity 1 \
+  --dividend-yield 0.02 \
+  --compound-strike 8 \
+  --compound-maturity 0.5 \
+  --underlying-maturity 1
+```
+
 ## Using it as a Python module
 
 ```python
@@ -239,15 +259,19 @@ For numerical inversion, the implied-volatility and implied-spot routines use br
 
 ## Running tests
 
-Install pytest if needed:
+Install `pytest` if it is not already available:
+
 ```bash
 python -m pip install pytest
 ```
 
 Run the test suite from the project root:
+
 ```bash
-python -m pytest tests
+python -m pytest tests -q
 ```
+
+The tests cover Black-Scholes pricing and Greeks, put-call parity, implied volatility and implied spot recovery, and Monte Carlo estimates benchmarked against Black-Scholes prices.
 
 ## Limitations
 

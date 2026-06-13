@@ -10,8 +10,8 @@ Functionalities included:
     - implied volatility and implied spot solvers
     - Cox-Ross-Rubinstein / forward / lognormal binomial trees
     - Bermudan-style vesting support in the tree engine
-    - exchange options, perpetual American options, Merton jump diffusion
-    - CIR and Vasicek zero-coupon bond pricing
+    - Monte Carlo pricing with Black-Scholes convergence benchmarking
+    - perpetual American options, Merton jump diffusion, compound options
 
 All rates, dividend yields and volatilities are annualized decimals.
 Example: 5% is passed as 0.05, not 5.
@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -84,11 +85,16 @@ class BinomialResult:
 
 
 @dataclass(frozen=True)
-class BondResult:
+class MonteCarloResult:
     price: float
-    long_rate: Optional[float]
-    delta: float
-    gamma: float
+    standard_error: float
+    confidence_interval_95: Tuple[float, float]
+    paths: int
+    antithetic: bool
+    seed: int
+    black_scholes_price: float
+    absolute_error: float
+    relative_error: float
 
 
 @dataclass(frozen=True)
@@ -165,6 +171,124 @@ def black_scholes_price(option_type: OptionType | str, m: MarketInputs) -> float
     if option_type == OptionType.CALL:
         return m.spot * df_q * norm_cdf(d1) - m.strike * df_r * norm_cdf(d2)
     return m.strike * df_r * norm_cdf(-d2) - m.spot * df_q * norm_cdf(-d1)
+
+
+
+def _sample_standard_error(values: Sequence[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((x - mean) ** 2 for x in values) / (len(values) - 1)
+    return math.sqrt(variance / len(values))
+
+
+def monte_carlo_option(
+    option_type: OptionType | str,
+    m: MarketInputs,
+    paths: int = 100_000,
+    seed: int = 42,
+    antithetic: bool = True,
+) -> MonteCarloResult:
+    """European option price by risk-neutral Monte Carlo simulation."""
+    validate_market_inputs(m)
+    option_type = OptionType(option_type)
+    if paths <= 0:
+        raise ValueError("paths must be positive")
+
+    benchmark = black_scholes_price(option_type, m)
+    if m.maturity <= EPS or m.volatility <= EPS:
+        return MonteCarloResult(
+            price=benchmark,
+            standard_error=0.0,
+            confidence_interval_95=(benchmark, benchmark),
+            paths=paths,
+            antithetic=antithetic,
+            seed=seed,
+            black_scholes_price=benchmark,
+            absolute_error=0.0,
+            relative_error=0.0,
+        )
+
+    rng = random.Random(seed)
+    drift = (m.rate - m.dividend_yield - 0.5 * m.volatility**2) * m.maturity
+    vol_step = m.volatility * math.sqrt(m.maturity)
+    discount = math.exp(-m.rate * m.maturity)
+    direction = 1.0 if option_type == OptionType.CALL else -1.0
+
+    observations: List[float] = []
+    if antithetic:
+        pair_count = (paths + 1) // 2
+        for _ in range(pair_count):
+            z = rng.gauss(0.0, 1.0)
+            st_up = m.spot * math.exp(drift + vol_step * z)
+            st_down = m.spot * math.exp(drift - vol_step * z)
+            payoff_up = max(direction * (st_up - m.strike), 0.0)
+            payoff_down = max(direction * (st_down - m.strike), 0.0)
+            observations.append(0.5 * (payoff_up + payoff_down))
+        actual_paths = pair_count * 2
+    else:
+        for _ in range(paths):
+            z = rng.gauss(0.0, 1.0)
+            st = m.spot * math.exp(drift + vol_step * z)
+            observations.append(max(direction * (st - m.strike), 0.0))
+        actual_paths = paths
+
+    mean_payoff = sum(observations) / len(observations)
+    price = discount * mean_payoff
+    standard_error = discount * _sample_standard_error(observations)
+    ci_low = price - 1.96 * standard_error
+    ci_high = price + 1.96 * standard_error
+    absolute_error = abs(price - benchmark)
+    relative_error = absolute_error / benchmark if benchmark > EPS else 0.0
+
+    return MonteCarloResult(
+        price=price,
+        standard_error=standard_error,
+        confidence_interval_95=(ci_low, ci_high),
+        paths=actual_paths,
+        antithetic=antithetic,
+        seed=seed,
+        black_scholes_price=benchmark,
+        absolute_error=absolute_error,
+        relative_error=relative_error,
+    )
+
+
+def monte_carlo_convergence(
+    option_type: OptionType | str,
+    m: MarketInputs,
+    path_counts: Sequence[int] = (1_000, 5_000, 10_000, 50_000, 100_000),
+    seed: int = 42,
+    antithetic: bool = True,
+) -> Dict[str, Any]:
+    """Compare Monte Carlo estimates with the Black-Scholes closed-form price."""
+    if not path_counts:
+        raise ValueError("path_counts cannot be empty")
+    if any(count <= 0 for count in path_counts):
+        raise ValueError("all path counts must be positive")
+
+    benchmark = black_scholes_price(option_type, m)
+    rows: List[Dict[str, Any]] = []
+    for i, count in enumerate(path_counts):
+        result = monte_carlo_option(option_type, m, paths=count, seed=seed + i, antithetic=antithetic)
+        rows.append(
+            {
+                "paths": result.paths,
+                "estimate": result.price,
+                "standard_error": result.standard_error,
+                "confidence_interval_95": result.confidence_interval_95,
+                "absolute_error": result.absolute_error,
+                "relative_error": result.relative_error,
+            }
+        )
+
+    return {
+        "option_type": OptionType(option_type).value,
+        "black_scholes_price": benchmark,
+        "antithetic": antithetic,
+        "seed": seed,
+        "runs": rows,
+    }
 
 
 def black_scholes_greeks(option_type: OptionType | str, m: MarketInputs) -> BlackScholesResult:
@@ -466,32 +590,6 @@ def binomial_lattice(
     return lattice
 
 
-def exchange_option_price(
-    option_type: OptionType | str,
-    asset1_price: float,
-    asset1_vol: float,
-    asset1_yield: float,
-    asset2_price: float,
-    asset2_vol: float,
-    asset2_yield: float,
-    correlation: float,
-    maturity: float,
-) -> float:
-    """Margrabe-style exchange option using the workbook's mapping."""
-    if not -1.0 <= correlation <= 1.0:
-        raise ValueError("correlation must be between -1 and 1")
-    combined_vol = math.sqrt(max(asset1_vol**2 + asset2_vol**2 - 2.0 * correlation * asset1_vol * asset2_vol, 0.0))
-    mapped = MarketInputs(
-        spot=asset1_price,
-        strike=asset2_price,
-        volatility=combined_vol,
-        rate=asset2_yield,
-        maturity=maturity,
-        dividend_yield=asset1_yield,
-    )
-    return black_scholes_price(option_type, mapped)
-
-
 def perpetual_american(option_type: OptionType | str, spot: float, strike: float, volatility: float, rate: float, dividend_yield: float) -> Tuple[float, float]:
     """Perpetual American option value and exercise boundary."""
     option_type = OptionType(option_type)
@@ -540,35 +638,6 @@ def merton_jump_diffusion(
 
     put = call + m.strike * math.exp(-m.rate * m.maturity) - m.spot * math.exp(-m.dividend_yield * m.maturity)
     return {"call": call, "put": put, "terms_used": i + 1}
-
-
-def cir_zero_coupon(a: float, b: float, market_price_of_risk: float, sigma: float, short_rate: float, maturity: float) -> BondResult:
-    """CIR zero-coupon bond price and rate sensitivities."""
-    if sigma <= 0 or maturity < 0:
-        raise ValueError("sigma must be positive and maturity non-negative")
-    gamma = math.sqrt((a - market_price_of_risk) ** 2 + 2.0 * sigma**2)
-    denom = (gamma - market_price_of_risk + a) * (math.exp(gamma * maturity) - 1.0) + 2.0 * gamma
-    A = (2.0 * gamma * math.exp((a - market_price_of_risk + gamma) * maturity / 2.0) / denom) ** (2.0 * a * b / sigma**2)
-    B = 2.0 * (math.exp(gamma * maturity) - 1.0) / denom
-    price = A * math.exp(-B * short_rate)
-    long_rate = 2.0 * a * b / (a - market_price_of_risk + gamma)
-    return BondResult(price=price, long_rate=long_rate, delta=-B * price / 100.0, gamma=B**2 * price / 100.0)
-
-
-def vasicek_zero_coupon(a: float, b: float, market_price_of_risk: float, sigma: float, short_rate: float, maturity: float) -> BondResult:
-    """Vasicek zero-coupon bond price and rate sensitivities."""
-    if sigma < 0 or maturity < 0:
-        raise ValueError("sigma and maturity must be non-negative")
-    if abs(a) > 1e-7:
-        long_rate = b + sigma * market_price_of_risk / a - 0.5 * sigma**2 / a**2
-        B = (1.0 - math.exp(-a * maturity)) / a
-        A = math.exp(long_rate * (B - maturity) - sigma**2 * B**2 / (4.0 * a))
-    else:
-        long_rate = None
-        B = maturity
-        A = math.exp(-0.5 * sigma * market_price_of_risk * maturity**2 + sigma**2 * maturity**3 / 6.0)
-    price = A * math.exp(-B * short_rate)
-    return BondResult(price=price, long_rate=long_rate, delta=-B * price / 100.0, gamma=B**2 * price / 100.0)
 
 
 def biv_norm_cdf(x: float, y: float, rho: float, terms: int = 35) -> float:
@@ -722,11 +791,12 @@ def run_demo() -> None:
             binomial_option(OptionType.PUT, m, steps=200, exercise_style=ExerciseStyle.AMERICAN, model=TreeModel.CRR)
         ),
         "merton_jump_diffusion": merton_jump_diffusion(m, jump_intensity=0.30, mean_jump_log=-0.08, jump_volatility=0.25),
+        "monte_carlo_call": asdict(monte_carlo_option(OptionType.CALL, m, paths=50_000, seed=42, antithetic=True)),
+        "monte_carlo_convergence": monte_carlo_convergence(OptionType.CALL, m, path_counts=(1_000, 5_000, 10_000, 50_000), seed=42),
         "perpetual_american_put": {
             "price": perpetual_american(OptionType.PUT, 100.0, 100.0, 0.20, 0.05, 0.02)[0],
             "boundary": perpetual_american(OptionType.PUT, 100.0, 100.0, 0.20, 0.05, 0.02)[1],
         },
-        "cir_bond": asdict(cir_zero_coupon(a=0.6, b=0.05, market_price_of_risk=0.0, sigma=0.12, short_rate=0.04, maturity=5.0)),
     }
     _print_json(demo_payload)
 
@@ -768,16 +838,19 @@ def build_parser() -> argparse.ArgumentParser:
     jump.add_argument("--mean-jump-log", type=float, default=-0.08)
     jump.add_argument("--jump-volatility", type=float, default=0.25)
 
-    exch = sub.add_parser("exchange", help="Exchange option")
-    exch.add_argument("--type", choices=[x.value for x in OptionType], default="call")
-    exch.add_argument("--asset1-price", type=float, default=100.0)
-    exch.add_argument("--asset1-vol", type=float, default=0.20)
-    exch.add_argument("--asset1-yield", type=float, default=0.02)
-    exch.add_argument("--asset2-price", type=float, default=95.0)
-    exch.add_argument("--asset2-vol", type=float, default=0.25)
-    exch.add_argument("--asset2-yield", type=float, default=0.03)
-    exch.add_argument("--correlation", type=float, default=0.40)
-    exch.add_argument("--maturity", type=float, default=1.0)
+    mc = sub.add_parser("mc", help="Monte Carlo European option price")
+    add_market_args(mc)
+    mc.add_argument("--type", choices=[x.value for x in OptionType], default="call")
+    mc.add_argument("--paths", type=int, default=100_000)
+    mc.add_argument("--seed", type=int, default=42)
+    mc.add_argument("--no-antithetic", action="store_true")
+
+    conv = sub.add_parser("mc-convergence", help="Benchmark Monte Carlo estimates against Black-Scholes")
+    add_market_args(conv)
+    conv.add_argument("--type", choices=[x.value for x in OptionType], default="call")
+    conv.add_argument("--path-counts", default="1000,5000,10000,50000,100000")
+    conv.add_argument("--seed", type=int, default=42)
+    conv.add_argument("--no-antithetic", action="store_true")
 
     perp = sub.add_parser("perpetual", help="Perpetual American option")
     perp.add_argument("--type", choices=[x.value for x in OptionType], default="put")
@@ -786,15 +859,6 @@ def build_parser() -> argparse.ArgumentParser:
     perp.add_argument("--volatility", type=float, default=0.20)
     perp.add_argument("--rate", type=float, default=0.05)
     perp.add_argument("--dividend-yield", type=float, default=0.02)
-
-    rates = sub.add_parser("rates", help="CIR or Vasicek zero-coupon bond")
-    rates.add_argument("--model", choices=["cir", "vasicek"], default="cir")
-    rates.add_argument("--a", type=float, default=0.60)
-    rates.add_argument("--b", type=float, default=0.05)
-    rates.add_argument("--market-price-of-risk", type=float, default=0.0)
-    rates.add_argument("--sigma", type=float, default=0.12)
-    rates.add_argument("--short-rate", type=float, default=0.04)
-    rates.add_argument("--maturity", type=float, default=5.0)
 
     comp = sub.add_parser("compound", help="Compound option price")
     add_market_args(comp)
@@ -843,32 +907,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _print_json(merton_jump_diffusion(m, args.jump_intensity, args.mean_jump_log, args.jump_volatility))
         return 0
 
-    if args.command == "exchange":
-        price = exchange_option_price(
-            args.type,
-            args.asset1_price,
-            args.asset1_vol,
-            args.asset1_yield,
-            args.asset2_price,
-            args.asset2_vol,
-            args.asset2_yield,
-            args.correlation,
-            args.maturity,
-        )
-        _print_json({"price": price})
+    if args.command == "mc":
+        m = _market_from_args(args)
+        result = monte_carlo_option(args.type, m, args.paths, args.seed, not args.no_antithetic)
+        _print_json(asdict(result))
+        return 0
+
+    if args.command == "mc-convergence":
+        m = _market_from_args(args)
+        path_counts = tuple(int(x.strip()) for x in args.path_counts.split(",") if x.strip())
+        _print_json(monte_carlo_convergence(args.type, m, path_counts, args.seed, not args.no_antithetic))
         return 0
 
     if args.command == "perpetual":
         price, boundary = perpetual_american(args.type, args.spot, args.strike, args.volatility, args.rate, args.dividend_yield)
         _print_json({"price": price, "exercise_boundary": boundary})
-        return 0
-
-    if args.command == "rates":
-        if args.model == "cir":
-            result = cir_zero_coupon(args.a, args.b, args.market_price_of_risk, args.sigma, args.short_rate, args.maturity)
-        else:
-            result = vasicek_zero_coupon(args.a, args.b, args.market_price_of_risk, args.sigma, args.short_rate, args.maturity)
-        _print_json(asdict(result))
         return 0
 
     if args.command == "compound":
